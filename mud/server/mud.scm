@@ -37,9 +37,23 @@
   (poll-idx mud-poll-idx set-mud-poll-idx!)
   (poll-set mud-poll-set))
 
+(define *port-timeout-table* (make-hash-table))
+(define *default-timeout* 15) ; 15 seconds timeout for each connection
 (define *error-events* (logior POLLHUP POLLERR))
 (define *read-events* POLLIN)
 (define *events* (logior *error-events* *read-events*))
+
+(define (add-new-port-timeout! port)
+  (hash-set! *port-timeout-table*
+             (port->fdes port)
+             (current-time)))
+
+(define (timeout? port)
+  (let ((t (hash-ref *port-timeout-table* (port->fdes port))))
+    (and t (> (- (current-time) t) *default-timeout*))))
+    
+(define (remove-port-timeout! port)
+  (hash-remove! *port-timeout-table* (port->fdes port)))
 
 ;; -> server
 (define* (mud-open #:key
@@ -64,16 +78,25 @@
       (let ((revents (poll-set-revents poll-set idx)))
         (cond
          ((zero? idx)
+          ;;(format #t "idx: ~a,  revents: ~a~%" idx revents)
+          ;;(display (hash-map->list cons *port-timeout-table*))(newline)
           ;; The server socket, and the end of our downward loop.
           (cond
            ((zero? revents)
+            ;;(display "1\n")
             ;; No client ready, and no error; poll and loop.
             (poll poll-set)
             (lp (1- (poll-set-nfds poll-set))))
            ((not (zero? (logand revents *error-events*)))
+            ;;(display "2\n")
             ;; An error.
             (set-mud-poll-idx! server idx)
             (throw 'interrupt))
+           ((not (zero? (logand revents POLLRDHUP)))
+            ;;(display "3\n")
+            ;; closed by client then closed it
+            (close-port (poll-set-remove! poll-set idx))
+            (lp (1- idx)))
            (else
             ;; A new client. Add to set, poll, and loop.
             ;;
@@ -98,6 +121,11 @@
             ;; throws an error.
             (set-mud-poll-idx! server (1- idx))
             (cond
+             ((timeout? port)
+              ;; long connection timeout
+              (remove-port-timeout! port)
+              (close-port port)
+              (lp (1- idx)))
              ((eof-object? (peek-char port))
               ;; EOF.
               (close-port port)
